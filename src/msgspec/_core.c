@@ -483,6 +483,11 @@ typedef struct {
     PyTypeObject *ABCMetaType;
     PyObject *_abc_init;
     PyObject *struct_lookup_cache;
+    /* Maps a recursive type alias object -> AliasInfo. Aliases have no __dict__
+     * and aren't weakref-able, so their AliasInfo can't be cached on the object
+     * (as structs etc. do via __msgspec_cache__); this module-level dict is used
+     * instead. See AliasInfo_Convert. */
+    PyObject *alias_cache;
     PyObject *str___weakref__;
     PyObject *str___dict__;
     PyObject *str___msgspec_cached_hash__;
@@ -2852,6 +2857,10 @@ AssocList_Sort(AssocList* list) {
 // Despite the fact that `frozendict` was added in 3.15,
 // this type is always defined for order consistency:
 #define MS_TYPE_FROZENDICT          ((1ull << 38) | (1ull << 39))
+/* A recursive PEP 695 type alias, indirected through an `AliasInfo` to break
+ * the reference cycle (see AliasInfo_Convert). Non-recursive aliases are
+ * expanded inline and never get this flag. */
+#define MS_TYPE_ALIAS               (1ull << 40)
 
 /* Aliases for commonly used types */
 #if PY315_PLUS
@@ -2928,7 +2937,8 @@ AssocList_Sort(AssocList* list) {
 #define SLOT_00 ( \
     MS_TYPE_STRUCT | MS_TYPE_STRUCT_ARRAY | \
     MS_TYPE_STRUCT_UNION | MS_TYPE_STRUCT_ARRAY_UNION | \
-    MS_TYPE_CUSTOM | MS_TYPE_CUSTOM_GENERIC \
+    MS_TYPE_CUSTOM | MS_TYPE_CUSTOM_GENERIC | \
+    MS_TYPE_ALIAS \
 )
 #define SLOT_01 (MS_TYPE_INTENUM | MS_TYPE_INTLITERAL)
 #define SLOT_02 (MS_TYPE_ENUM | MS_TYPE_STRLITERAL)
@@ -3020,6 +3030,16 @@ typedef struct {
     TypeNode *types[];
 } NamedTupleInfo;
 
+/* Indirection for a recursive PEP 695 type alias. Holds the TypeNode for the
+ * alias's (substituted) `__value__`. Cached in module state keyed by the alias
+ * object *before* `type` is filled in, so a recursive back-reference resolves
+ * to this in-flight object instead of expanding forever. GC-tracked so the
+ * alias<->value reference cycle is collectable. */
+typedef struct {
+    PyObject_HEAD
+    TypeNode *type;
+} AliasInfo;
+
 struct StructInfo;
 
 typedef struct {
@@ -3066,6 +3086,7 @@ static PyTypeObject LiteralInfo_Type;
 static PyTypeObject TypedDictInfo_Type;
 static PyTypeObject DataclassInfo_Type;
 static PyTypeObject NamedTupleInfo_Type;
+static PyTypeObject AliasInfo_Type;
 static PyTypeObject StructInfo_Type;
 static PyTypeObject StructMetaType;
 static PyTypeObject Ext_Type;
@@ -3074,6 +3095,7 @@ static PyObject* StructInfo_Convert(PyObject*);
 static PyObject* TypedDictInfo_Convert(PyObject*);
 static PyObject* DataclassInfo_Convert(PyObject*);
 static PyObject* NamedTupleInfo_Convert(PyObject*);
+static PyObject* AliasInfo_Convert(PyObject*);
 
 #define StructMeta_GET_FIELDS(s) (((StructMetaObject *)(s))->struct_fields)
 #define StructMeta_GET_NFIELDS(s) (PyTuple_GET_SIZE((((StructMetaObject *)(s))->struct_fields)))
@@ -3163,6 +3185,12 @@ TypeNode_get_struct_union(TypeNode *type) {
 static MS_INLINE PyObject *
 TypeNode_get_custom(TypeNode *type) {
     /* Custom types can't be mixed with anything */
+    return type->details[0].pointer;
+}
+
+static MS_INLINE PyObject *
+TypeNode_get_alias_info(TypeNode *type) {
+    /* Alias types are standalone (see MS_TYPE_ALIAS), always first */
     return type->details[0].pointer;
 }
 
@@ -3408,8 +3436,10 @@ TypeNode_get_traverse_ranges(
     Py_ssize_t *fixtuple_offset, Py_ssize_t *fixtuple_size
 ) {
     Py_ssize_t n_obj = 0, n_type = 0, ft_offset = 0, ft_size = 0;
-    /* Custom types cannot share a union with anything except `None` */
-    if (type->types & (MS_TYPE_CUSTOM | MS_TYPE_CUSTOM_GENERIC)) {
+    /* Custom types cannot share a union with anything except `None`. Recursive
+     * type aliases are likewise standalone (see MS_TYPE_ALIAS): a single
+     * `AliasInfo` PyObject detail. */
+    if (type->types & (MS_TYPE_CUSTOM | MS_TYPE_CUSTOM_GENERIC | MS_TYPE_ALIAS)) {
         n_obj = 1;
     }
     else if (!(type->types & MS_TYPE_ANY)) {
@@ -3575,6 +3605,7 @@ typedef struct {
     PyObject *intenum_obj;
     PyObject *enum_obj;
     PyObject *custom_obj;
+    PyObject *alias_obj;  /* an AliasInfo, for a recursive type alias */
     PyObject *array_el_obj;
     PyObject *dict_key_obj;
     PyObject *dict_val_obj;
@@ -3901,6 +3932,7 @@ typenode_from_collect_state(TypeNodeCollectState *state) {
             MS_TYPE_STRUCT | MS_TYPE_STRUCT_ARRAY |
             MS_TYPE_STRUCT_UNION | MS_TYPE_STRUCT_ARRAY_UNION |
             MS_TYPE_CUSTOM | MS_TYPE_CUSTOM_GENERIC |
+            MS_TYPE_ALIAS |
             MS_TYPE_INTENUM | MS_TYPE_INTLITERAL |
             MS_TYPE_ENUM | MS_TYPE_STRLITERAL |
             MS_TYPE_TYPEDDICT | MS_TYPE_DATACLASS |
@@ -3959,6 +3991,10 @@ typenode_from_collect_state(TypeNodeCollectState *state) {
          * location  (e.g. `mpack_decode`). */
         out->types |= MS_TYPE_ANY;
         out->details[e_ind++].pointer = state->custom_obj;
+    }
+    if (state->alias_obj != NULL) {
+        Py_INCREF(state->alias_obj);
+        out->details[e_ind++].pointer = state->alias_obj;
     }
     if (state->struct_info != NULL) {
         Py_INCREF(state->struct_info);
@@ -4820,6 +4856,7 @@ typenode_collect_clear_state(TypeNodeCollectState *state) {
     Py_CLEAR(state->intenum_obj);
     Py_CLEAR(state->enum_obj);
     Py_CLEAR(state->custom_obj);
+    Py_CLEAR(state->alias_obj);
     Py_CLEAR(state->array_el_obj);
     Py_CLEAR(state->dict_key_obj);
     Py_CLEAR(state->dict_val_obj);
@@ -5303,6 +5340,118 @@ invalid:
     goto done;
 }
 
+#if PY312_PLUS
+/* Is `obj` a PEP 695 type alias (`type X = ...`), either the bare
+ * `TypeAliasType` or a parametrized `Alias[int]` whose origin is one? If so
+ * return a new reference to the alias object to use as a cache key, and set
+ * `*value` to a new reference to the (substituted) `__value__` to expand.
+ * Otherwise return NULL with no exception set. */
+static PyObject *
+ms_get_type_alias(MsgspecState *mod, PyObject *obj, PyObject **value) {
+    if (Py_TYPE(obj) == (PyTypeObject *)(mod->typing_typealiastype)) {
+        PyObject *val = PyObject_GetAttr(obj, mod->str___value__);
+        if (val == NULL) return NULL;
+        *value = val;
+        Py_INCREF(obj);
+        return obj;
+    }
+    /* Parametrized alias: `__origin__` is a TypeAliasType, expand
+     * `origin.__value__[args]` to substitute the type parameters. */
+    PyObject *origin = PyObject_GetAttr(obj, mod->str___origin__);
+    if (origin == NULL) {
+        PyErr_Clear();
+        return NULL;
+    }
+    if (Py_TYPE(origin) != (PyTypeObject *)(mod->typing_typealiastype)) {
+        Py_DECREF(origin);
+        return NULL;
+    }
+    PyObject *args = PyObject_GetAttr(obj, mod->str___args__);
+    if (args == NULL) {
+        Py_DECREF(origin);
+        return NULL;
+    }
+    PyObject *unbound = PyObject_GetAttr(origin, mod->str___value__);
+    Py_DECREF(origin);
+    if (unbound == NULL) {
+        Py_DECREF(args);
+        return NULL;
+    }
+    PyObject *val = PyObject_GetItem(unbound, args);
+    Py_DECREF(unbound);
+    Py_DECREF(args);
+    if (val == NULL) return NULL;
+    *value = val;
+    Py_INCREF(obj);
+    return obj;
+}
+
+/* Build (or fetch from cache) the AliasInfo for a recursive type alias `obj`.
+ * `value` is its (already substituted) `__value__`. Mirrors StructInfo_Convert:
+ * the placeholder is inserted into the module-level alias cache *before*
+ * expanding `value`, so a recursive back-reference resolves to the in-flight
+ * AliasInfo instead of recursing forever. */
+static PyObject *
+AliasInfo_Convert(PyObject *obj) {
+    MsgspecState *mod = msgspec_get_global_state();
+    PyObject *value = NULL;
+    PyObject *alias = ms_get_type_alias(mod, obj, &value);
+    if (alias == NULL) {
+        if (!PyErr_Occurred()) {
+            PyErr_Format(PyExc_RuntimeError, "Expected a type alias, got %R", obj);
+        }
+        return NULL;
+    }
+
+    /* Return the cached AliasInfo if one exists (also the recursion break) */
+    PyObject *cached = NULL;
+    if (PyDict_GetItemRef(mod->alias_cache, alias, &cached) < 0) {
+        Py_DECREF(alias);
+        Py_DECREF(value);
+        return NULL;
+    }
+    if (cached != NULL) {
+        Py_DECREF(alias);
+        Py_DECREF(value);
+        return cached;
+    }
+
+    /* Allocate a placeholder AliasInfo and insert it into the cache before
+     * expanding `value` */
+    AliasInfo *info = PyObject_GC_New(AliasInfo, &AliasInfo_Type);
+    if (info == NULL) {
+        Py_DECREF(alias);
+        Py_DECREF(value);
+        return NULL;
+    }
+    info->type = NULL;
+    PyObject_GC_Track(info);
+
+    if (PyDict_SetItem(mod->alias_cache, alias, (PyObject *)info) < 0) {
+        Py_DECREF(alias);
+        Py_DECREF(value);
+        Py_DECREF(info);
+        return NULL;
+    }
+
+    /* Expand `value`. Recursive references to `alias` resolve to `info` above. */
+    info->type = TypeNode_Convert(value);
+    Py_DECREF(value);
+    if (info->type == NULL) {
+        /* Roll back the cache entry, mirroring StructInfo_Convert's error path */
+        PyObject *err_type, *err_value, *err_tb;
+        PyErr_Fetch(&err_type, &err_value, &err_tb);
+        PyDict_DelItem(mod->alias_cache, alias);
+        PyErr_Restore(err_type, err_value, err_tb);
+        Py_DECREF(alias);
+        Py_DECREF(info);
+        return NULL;
+    }
+    Py_DECREF(alias);
+    return (PyObject *)info;
+}
+#endif
+
 static TypeNode *
 TypeNode_Convert(PyObject *obj) {
     TypeNode *out = NULL;
@@ -5311,6 +5460,38 @@ TypeNode_Convert(PyObject *obj) {
     state.context = obj;
 
     if (Py_EnterRecursiveCall(" while analyzing a type")) return NULL;
+
+#if PY312_PLUS
+    /* Intercept PEP 695 type aliases at the conversion boundary (the root type
+     * and every container element). Union members are collected inline on the
+     * shared state and never reach here, so aliases stay transparent inside
+     * unions (their members still participate in union-invariant checks). A
+     * recursive back-reference resolves to the cached in-flight AliasInfo,
+     * breaking the cycle. */
+    {
+        bool is_alias =
+            Py_TYPE(obj) == (PyTypeObject *)(state.mod->typing_typealiastype);
+        if (!is_alias) {
+            PyObject *origin = PyObject_GetAttr(obj, state.mod->str___origin__);
+            if (origin != NULL) {
+                is_alias = Py_TYPE(origin) ==
+                    (PyTypeObject *)(state.mod->typing_typealiastype);
+                Py_DECREF(origin);
+            }
+            else {
+                PyErr_Clear();
+            }
+        }
+        if (is_alias) {
+            PyObject *info = AliasInfo_Convert(obj);
+            if (info == NULL) goto done;
+            state.alias_obj = info;  /* steals the reference */
+            state.types = MS_TYPE_ALIAS;
+            out = typenode_from_collect_state(&state);
+            goto done;
+        }
+    }
+#endif
 
     /* Traverse `obj` to collect all type annotations at this level */
     if (typenode_collect_type(&state, obj) < 0) goto done;
@@ -9211,6 +9392,38 @@ static PyTypeObject NamedTupleInfo_Type = {
     .tp_clear = (inquiry)NamedTupleInfo_clear,
     .tp_traverse = (traverseproc)NamedTupleInfo_traverse,
     .tp_dealloc = (destructor)NamedTupleInfo_dealloc,
+};
+
+static int
+AliasInfo_traverse(AliasInfo *self, visitproc visit, void *arg)
+{
+    return TypeNode_traverse(self->type, visit, arg);
+}
+
+static int
+AliasInfo_clear(AliasInfo *self)
+{
+    TypeNode_Free(self->type);
+    self->type = NULL;
+    return 0;
+}
+
+static void
+AliasInfo_dealloc(AliasInfo *self)
+{
+    PyObject_GC_UnTrack(self);
+    AliasInfo_clear(self);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static PyTypeObject AliasInfo_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "msgspec._core.AliasInfo",
+    .tp_basicsize = sizeof(AliasInfo),
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+    .tp_clear = (inquiry)AliasInfo_clear,
+    .tp_traverse = (traverseproc)AliasInfo_traverse,
+    .tp_dealloc = (destructor)AliasInfo_dealloc,
 };
 
 
@@ -16754,6 +16967,10 @@ mpack_decode(
     if (MS_UNLIKELY(type->types == 0)) {
         return mpack_decode_raw(self);
     }
+    if (MS_UNLIKELY(type->types & MS_TYPE_ALIAS)) {
+        AliasInfo *info = (AliasInfo *)TypeNode_get_alias_info(type);
+        return mpack_decode(self, info->type, path, is_key);
+    }
     PyObject *obj = mpack_decode_nocustom(self, type, path, is_key);
     if (MS_UNLIKELY(type->types & (MS_TYPE_CUSTOM | MS_TYPE_CUSTOM_GENERIC))) {
         return ms_decode_custom(obj, self->dec_hook, type, path);
@@ -19262,6 +19479,10 @@ json_decode(
 ) {
     if (MS_UNLIKELY(type->types == 0)) {
         return json_decode_raw(self);
+    }
+    if (MS_UNLIKELY(type->types & MS_TYPE_ALIAS)) {
+        AliasInfo *info = (AliasInfo *)TypeNode_get_alias_info(type);
+        return json_decode(self, info->type, path);
     }
     PyObject *obj = json_decode_nocustom(self, type, path);
     if (MS_UNLIKELY(type->types & (MS_TYPE_CUSTOM | MS_TYPE_CUSTOM_GENERIC))) {
@@ -22368,6 +22589,10 @@ static PyObject *
 convert(
     ConvertState *self, PyObject *obj, TypeNode *type, PathNode *path
 ) {
+    if (MS_UNLIKELY(type->types & MS_TYPE_ALIAS)) {
+        AliasInfo *info = (AliasInfo *)TypeNode_get_alias_info(type);
+        return convert(self, obj, info->type, path);
+    }
     if (MS_UNLIKELY(type->types & (MS_TYPE_CUSTOM | MS_TYPE_CUSTOM_GENERIC | MS_TYPE_ANY))) {
         Py_INCREF(obj);
         if (MS_UNLIKELY(type->types & (MS_TYPE_CUSTOM | MS_TYPE_CUSTOM_GENERIC))) {
@@ -22648,6 +22873,7 @@ msgspec_clear(PyObject *m)
     Py_CLEAR(st->ABCMetaType);
     Py_CLEAR(st->_abc_init);
     Py_CLEAR(st->struct_lookup_cache);
+    Py_CLEAR(st->alias_cache);
     Py_CLEAR(st->str___weakref__);
     Py_CLEAR(st->str___dict__);
     Py_CLEAR(st->str___msgspec_cached_hash__);
@@ -22757,6 +22983,7 @@ msgspec_traverse(PyObject *m, visitproc visit, void *arg)
     Py_VISIT(st->ABCMetaType);
     Py_VISIT(st->_abc_init);
     Py_VISIT(st->struct_lookup_cache);
+    Py_VISIT(st->alias_cache);
     Py_VISIT(st->typing_union);
     Py_VISIT(st->typing_any);
     Py_VISIT(st->typing_literal);
@@ -22829,6 +23056,8 @@ PyInit__core(void)
     if (PyType_Ready(&DataclassInfo_Type) < 0)
         return NULL;
     if (PyType_Ready(&NamedTupleInfo_Type) < 0)
+        return NULL;
+    if (PyType_Ready(&AliasInfo_Type) < 0)
         return NULL;
     if (PyType_Ready(&StructInfo_Type) < 0)
         return NULL;
@@ -22942,6 +23171,11 @@ PyInit__core(void)
     /* Initialize the struct_lookup_cache */
     st->struct_lookup_cache = PyDict_New();
     if (PyModule_AddObjectRef(m, "_struct_lookup_cache", st->struct_lookup_cache) < 0)
+        return NULL;
+
+    /* Initialize the alias_cache (recursive type alias -> AliasInfo) */
+    st->alias_cache = PyDict_New();
+    if (PyModule_AddObjectRef(m, "_alias_cache", st->alias_cache) < 0)
         return NULL;
 
 #define SET_REF(attr, name) \

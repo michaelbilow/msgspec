@@ -51,6 +51,148 @@ TypedDict / dataclass / NamedTuple use the same pattern via `__msgspec_cache__`.
 Their Info objects are GC-tracked and traversed so the reference cycle is
 collectable by Python's GC (not freed by raw recursion).
 
+## ⚠️⚠️ Second finding: aliases must stay TRANSPARENT inside unions
+
+Verified today (`/tmp/alias_union.py`, `/tmp/alias_union2.py`) that aliases are
+currently expanded **before** union-invariant checks run, so an alias is fully
+transparent to the surrounding union:
+
+- `bytes | IntStr` (where `type IntStr = int | str`) → `TypeError: ... more than
+  one str-like type`. The `str` *inside the alias* collides with... itself?
+  No — the error shows the alias's members are flattened into the outer union and
+  checked as peers.
+- `set[str] | Lst` (where `type Lst = list[int]`) → `TypeError: ... more than one
+  array-like`. The `list` inside `Lst` is seen by the "one array-like per union"
+  invariant.
+- `int | Lst` and `int | Flt` decode fine — members flatten and dispatch by
+  distinct JSON tokens.
+
+**Implication for the always-indirect design:** if an alias becomes an *opaque*
+`MS_TYPE_ALIAS` node, the outer union can no longer see the types hidden inside
+it. That would (a) silently bypass the union-invariant checks above (correctness
+regression — two array-likes could slip through), and (b) break token-based
+union dispatch (the decoder picks a union member by input token; an opaque alias
+node has no token class the dispatcher understands).
+
+So we **cannot** make every alias opaque. The alias indirection must only kick in
+where it's actually needed to break a cycle. Refined model:
+
+- **Non-recursive alias** (the overwhelmingly common case): keep TODAY's inline
+  expansion. Zero behavior change, no opacity, unions keep working. This is also
+  the zero-hot-path-cost outcome.
+- **Recursive alias:** introduce the `AliasInfo` indirection ONLY on the
+  back-edge that would otherwise recurse forever. i.e. the *first* expansion of
+  `type JSON = ... list[JSON] ...` proceeds inline as a union; when `list[JSON]`
+  re-references `JSON`, THAT inner reference resolves to the cached `AliasInfo`
+  placeholder instead of re-expanding.
+
+This is effectively the "detect-and-indirect only recursive aliases" option
+that was listed (and not chosen) in the original design question — the union
+semantics force it. The module-level cache dict (option 1) is still the storage
+mechanism; what changes is that the top-level/non-recursive expansion is NOT
+wrapped in an alias node, only the recursive back-reference is.
+
+### DECISION (locked): container-guarded recursion only
+
+Support recursion that passes **through a container** (list/dict/set/tuple, or a
+struct field — anything that gives the recursive `TypeNode` its own nested slot
+that is not a union peer). Leave *unguarded* self-references erroring cleanly.
+
+Rationale — the hard cases are exactly the degenerate ones:
+
+| Alias | Recurses through | Inhabitable? | Decision |
+|---|---|---|---|
+| `type JSON = ... \| list[JSON] \| dict[str,JSON]` | list/dict (empty = base case) | yes | **support** |
+| `type Tree[T] = tuple[T, list[Tree[T]]]` | list | yes | **support** |
+| `type A = list[B]; type B = list[A]` | list | yes | **support** |
+| `type Ex = Ex \| None` | nothing (direct union member) | only `None` | **error cleanly** |
+| `type Ex = tuple[Ex, int]` | fixtuple, no base case | no (uninhabitable) | **error cleanly** |
+
+`type Ex = Ex | None` collapses to just `None` (the recursive branch adds no
+inhabitants); `type Ex = tuple[Ex, int]` has no base case so no finite value
+satisfies it. Neither is a real-world type — they exist only as
+"error-cleanly" torture inputs. This mirrors recursive **Structs**, which only
+ever recurse behind a named field (structurally = "behind a container") and thus
+never hit union opacity.
+
+Practically: the `AliasInfo` back-edge is only ever installed when the recursive
+reference is reached inside a container element `TypeNode_Convert` (dict/array/
+fixtuple/struct-field), never as a direct union member. A back-reference that
+surfaces as a bare union member remains a `RecursionError` (kept by
+`test_recursive_typealias_errors`).
+
+**Nuance — fixtuple counts as a container.** `tuple[Ex, int]` recurses through a
+fixtuple element, which IS a nested `TypeNode` slot. So `type Ex = tuple[Ex, int]`
+(and the generic `tuple`-based cases 3–5 in `test_recursive_typealias_errors`)
+will now **build successfully** — the cycle breaks via `AliasInfo`. They're
+uninhabitable, so decode fails at runtime (`ValidationError` once finite input
+runs out of nesting), not at build. Net effect when the feature lands:
+`test_recursive_typealias_errors` narrows to only the genuinely-unguarded
+`type Ex = Ex | None` (still build-time `RecursionError`); the tuple cases move to
+"builds, but no finite value decodes." Finalize these expectations empirically
+once the C lands rather than guessing now.
+
+## ★ Linchpin architecture: intercept at the `TypeNode_Convert` boundary
+
+The single key decision that makes everything else fall out correctly:
+
+> **Aliases are indirected (→ `AliasInfo`/`MS_TYPE_ALIAS`) ONLY at the
+> `TypeNode_Convert` boundary. Inline collection
+> (`typenode_collect_type` / `typenode_origin_args_metadata`) keeps expanding
+> aliases inline, unchanged.**
+
+Why this works — the two paths a type reference can travel:
+
+1. **Inline path** — union members. The union branch (`:5223`) collects each
+   member via `typenode_collect_type(state, arg)` on the *shared* state;
+   `typenode_origin_args_metadata` expands an alias member's `__value__` inline.
+   → **Union transparency preserved for free.** `bytes | IntStr` still flattens
+   and still fires the "one str-like type" invariant; `set[str] | Lst` still
+   fires "one array-like". No change to these.
+2. **Fresh-conversion path** — the root type, and every container element
+   (dict key/val `:4053`/`:4056`, fixtuple `:4065`, array `:4073`). These call a
+   *fresh* `TypeNode_Convert(element)`. → This is where we intercept: if the
+   object is a `TypeAliasType` (or a parametrized alias whose origin is one),
+   build a standalone `{types: MS_TYPE_ALIAS, details[0] = AliasInfo}` node
+   instead of expanding.
+
+Union members never cross the fresh-conversion boundary, so intercepting there
+NEVER touches a union member. An `MS_TYPE_ALIAS` node is therefore always
+standalone (never OR-ed with other type bits) → detail-slot logic is trivial
+(exclusive, like `MS_TYPE_CUSTOM`).
+
+### Why the degenerate cases still behave exactly as decided
+
+- `type Ex = Ex | None`: `TypeNode_Convert(Ex)` → `AliasInfo_Convert(Ex)` →
+  `info->type = TypeNode_Convert(Ex|None)` → union branch collects `Ex` *inline*
+  via `typenode_collect_type` → re-expands `Ex.__value__ = Ex|None` inline →
+  inline union recursion → `Py_EnterRecursiveCall` (`:5219`) → **RecursionError**.
+  The back-edge is a direct union member, never crosses the fresh-conversion
+  boundary, so it is never indirected. ✅ still errors cleanly.
+- `type Ex = tuple[Ex, int]`: the `Ex` back-edge is a *fixtuple element* → fresh
+  `TypeNode_Convert(Ex)` → hits the cached placeholder → **builds**; uninhabitable
+  so decode fails at runtime. ✅ matches the nuance above.
+- `type JSON = ... | list[JSON] | ...`: `list[JSON]` element → fresh
+  `TypeNode_Convert(JSON)` → cached placeholder → terminates, builds. ✅
+
+### `AliasInfo_Convert(alias)` sequence (module-dict cache)
+
+1. `dict[alias]` lookup → hit returns cached `AliasInfo` (handles both the
+   recursive back-edge and cross-references between distinct types).
+2. miss: alloc `AliasInfo` with `type = NULL`; `dict[alias] = info` (placeholder
+   inserted *before* expansion).
+3. `info->type = TypeNode_Convert(alias.__value__)` — for a parametrized alias,
+   substitute args first (`alias.__value__[args]`, cf. `:4922`). Recursive
+   container references to `alias` resolve to the placeholder from step 1.
+4. return `info`. `->type` is non-NULL before any decode runs.
+5. error after insert → remove `dict[alias]` (mirror `StructInfo`'s cache
+   rollback at `:7115`).
+
+Note: this indirects *non-recursive* aliases that appear as container elements /
+root too (e.g. `list[Pair]` for a non-recursive `Pair`). That's harmless — one
+extra pointer hop, no opacity issue since it's not a union member — and keeps the
+logic uniform. Union-member aliases remain fully inlined.
+
 ## ⚠️ Revision: `__msgspec_cache__`-on-the-alias does NOT work
 
 Verified on 3.12 and 3.13 (`/tmp/alias_attr.py`, `/tmp/cache_strategy.py`,
@@ -94,18 +236,13 @@ Use a **module-level cache dict keyed by the alias object**, not an attribute:
   don't collide (they hash differently — verified) and that
   `Pair[int] == Pair[int]` across instances is stable (verified True).
 
-### OPEN DECISION for the user (changes the C surface)
+### DECISION (locked): module-level dict in `MsgspecState`
 
-The Python-attribute cache is off the table; pick the storage:
-
-1. **Module-level dict in `MsgspecState`** keyed by the alias (recommended;
-   mirrors `struct_lookup_cache`). Needs GC traverse/clear of that dict and
-   thread-safety via the existing critical-section pattern.
-2. **Resolve aliases in Python before they reach C** — expand `__value__` in
-   `_utils.py`/a helper into a structure the C layer already handles, breaking
-   cycles Python-side with a normal dict + placeholder. Keeps `_core.c` smaller
-   but moves real logic into Python and must reproduce the parametrized-generic
-   substitution (`alias.__value__[args]`) faithfully.
+Chosen: **option 1 — module-level cache dict in `MsgspecState`**, keyed by the
+alias object, mirroring `struct_lookup_cache`. Needs GC traverse/clear of that
+dict and thread-safety via the existing critical-section pattern. (Option 2,
+Python-side pre-resolution, was rejected to keep alias resolution next to the
+type-collection machinery.)
 
 Everything downstream of "how the placeholder is stored" (AliasInfo object,
 MS_TYPE_ALIAS flag, dispatch, traverse) is unchanged from steps A2/A5/A6/A7.
