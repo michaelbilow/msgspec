@@ -55,6 +55,7 @@ __all__ = (
     "EnumType",
     "LiteralType",
     "CustomType",
+    "AliasType",
     "UnionType",
     "CollectionType",
     "ListType",
@@ -325,6 +326,27 @@ class CustomType(Type):
     """
 
     cls: type
+
+
+class AliasType(Type):
+    """A recursive `type` alias (PEP 695).
+
+    Only *recursive* type aliases are represented this way; non-recursive
+    aliases are transparently expanded to their underlying type. This node
+    exists so that self-referential aliases (e.g. ``type JSON = int | str |
+    list[JSON]``) form a finite, cyclic type graph and can be emitted as a
+    named ``$ref`` component in a JSON schema.
+
+    Parameters
+    ----------
+    cls: TypeAliasType
+        The corresponding type alias object.
+    type: Type
+        The type the alias expands to. May refer back to this ``AliasType``.
+    """
+
+    cls: Any
+    type: Type = None
 
 
 class UnionType(Type):
@@ -752,11 +774,27 @@ def _merge_json(a, b):
     return a
 
 
+def _type_alias_value(t):
+    """If ``t`` is a PEP 695 type alias (bare ``TypeAliasType`` or a
+    parametrized ``Alias[int]`` whose origin is one), return ``(alias, value)``
+    where ``value`` is the (substituted) ``__value__`` to expand. Otherwise
+    return ``None``."""
+    if type(t) is _TypeAliasType:
+        return t, t.__value__
+    origin = getattr(t, "__origin__", None)
+    if origin is not None and type(origin) is _TypeAliasType:
+        return t, origin.__value__[t.__args__]
+    return None
+
+
 class _Translator:
     def __init__(self, types):
         self.types = tuple(types)
         self.type_hints = {}
         self.cache = {}
+        # Aliases currently being expanded, mapped to their AliasType
+        # placeholder. Used to detect (and break) recursive aliases.
+        self.in_progress_aliases = {}
 
     def _get_class_annotations(self, t):
         """A cached version of `get_class_annotations`"""
@@ -774,6 +812,30 @@ class _Translator:
         return tuple(self.translate(t) for t in self.types)
 
     def translate(self, typ):
+        # Intercept PEP 695 type aliases so recursive ones form a finite cyclic
+        # graph instead of expanding forever. Non-recursive aliases are unwrapped
+        # to stay transparent (same output as expanding inline).
+        alias = _type_alias_value(typ)
+        if alias is not None:
+            key, value = alias
+            if key in self.in_progress_aliases:
+                # Recursive back-reference: return the in-flight placeholder and
+                # mark the alias as genuinely recursive.
+                node = self.in_progress_aliases[key]
+                node.cls = key
+                return node
+            node = AliasType(cls=None)
+            self.in_progress_aliases[key] = node
+            try:
+                node.type = self.translate(value)
+            finally:
+                del self.in_progress_aliases[key]
+            if node.cls is None:
+                # Never referenced back -> not recursive, stay transparent.
+                return node.type
+            self.cache[key] = node
+            return node
+
         t, args, metadata = _origin_args_metadata(typ)
 
         # Extract and merge components of any `Meta` annotations

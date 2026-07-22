@@ -10,6 +10,12 @@
 - Support the PyEmscripten (Pyodide) platform ({pr}`1083`).
 - Fix handling of PEP 695 type parameter syntax (`class Foo[T]`) and of
   `types.GenericAlias` instances in type annotations ({pr}`962`).
+- Support recursive PEP 695 type aliases (e.g.
+  `type JSON = int | str | bool | None | list[JSON] | dict[str, JSON]`) in
+  decoding, `convert`, `inspect.type_info`, and `json.schema`. Recursion must
+  pass through a container (list/dict/tuple/struct field); recursive aliases are
+  emitted as named ``$ref`` components in JSON schema. Adds
+  `msgspec.inspect.AliasType`.
 - Fix a crash on incorrect `typing.ClassVar` annotations ({pr}`1097`).
 - Fix an `AttributeError` when converting to a `Struct` type defined in a
   namespace without a `__name__` ({pr}`1072`).

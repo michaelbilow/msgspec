@@ -256,7 +256,36 @@ MS_TYPE_ALIAS flag, dispatch, traverse) is unchanged from steps A2/A5/A6/A7.
 | encode | `_core.c` | ✅ already (object-driven, not type-driven) | none |
 | `to_builtins` | `_core.c` | ✅ already (object-driven) | none |
 | `inspect.type_info` | `inspect.py` | ❌ | ref/cache for aliases |
-| `json.schema` | `_json_schema.py` | ❌ | **transitive** — built on `inspect.multi_type_info`; fixing inspect fixes schema (it already emits `$ref` for cycles) |
+| `json.schema` | `_json_schema.py` | ❌ | **NOT transitive after all** — see finding below |
+
+### ⚠️⚠️⚠️ Third finding: schema is NOT "transitive/free" for union aliases
+
+Original assumption (❌ wrong): "fixing inspect fixes schema, it already emits
+`$ref` for cycles." Verified false today:
+
+- `_collect_component_types` / `to_schema` only emit a `$ref` for types with a
+  `.cls` attribute — i.e. **nominal** types: Struct, TypedDict, Dataclass,
+  NamedTuple, Enum (`_json_schema.py:129-137`, `:235-238`). Recursive *structs*
+  work in schema precisely because they're nominal.
+- A recursive alias to a **union/collection** (`type JSON = int | str |
+  list[JSON]`) has **no `.cls`**. `to_schema` walks it structurally
+  (`UnionType`→`CollectionType`→…) with **no cycle guard**, so even a correctly
+  cyclic `inspect` graph → infinite recursion in `to_schema`.
+
+Implication: real `json.schema` support for union/collection aliases needs the
+schema layer to treat a recursive alias as a **nameable `$ref` component**. That
+means either (a) a dedicated `mi.AliasType` node carrying the alias's name/cls so
+`_collect_component_types` + `name_map` + `to_schema`'s `$ref` short-circuit pick
+it up, or (b) a generic cycle-guard in `to_schema`/`collect` for non-nominal
+nodes. Both are meaningfully larger than "free."
+
+**DECISION (locked): full parity.** Implement (a) — a dedicated `mi.AliasType`
+node carrying the alias object as `.cls`, so `_collect_component_types`,
+`_build_name_map`, and `to_schema`'s `$ref` short-circuit treat a recursive
+alias as a nameable `$defs` component exactly like a recursive Struct. This also
+solves the `inspect` cycle: `AliasType` is a mutable placeholder cached in
+`_Translator.cache` (keyed by the alias) *before* its `type` is filled, breaking
+the cycle the same way `StructType` does.
 
 ## Implementation steps
 

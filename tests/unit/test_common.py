@@ -4735,10 +4735,20 @@ class TestTypeAlias:
                 msgspec.json.Decoder(mod.Pair[int, int])
 
     @py312_plus
+    @emscripten_stack_limited
+    def test_recursive_typealias_unguarded_errors(self):
+        # An *unguarded* self-reference (a direct union member, not behind a
+        # container) can't be represented: the back-edge lands as a union member,
+        # which stays inline. It still errors cleanly with RecursionError, as
+        # before. (`type Ex = Ex | None` also collapses to just `None`.)
+        with temp_module("type Ex = Ex | None") as mod:
+            with pytest.raises(RecursionError):
+                msgspec.json.Decoder(mod.Ex)
+
+    @py312_plus
     @pytest.mark.parametrize(
         "src",
         [
-            "type Ex = Ex | None",
             "type Ex = tuple[Ex, int]",
             "type Ex[T] = tuple[T, Ex[T]]",
             "type Temp[T] = tuple[T, Temp[T]]; Ex = Temp[int]",
@@ -4746,13 +4756,15 @@ class TestTypeAlias:
         ],
     )
     @emscripten_stack_limited
-    def test_recursive_typealias_errors(self, src):
-        """For now recursive aliases error cleanly with RecursionError. Once the
-        `AliasInfo` indirection lands (see the `test_recursive_typealias_*`
-        cases below), this should be replaced with roundtrip assertions."""
+    def test_recursive_typealias_uninhabitable(self, src):
+        # These recurse through a fixtuple (a container), so they now *build* via
+        # the AliasInfo indirection. But they have no base case, so no finite
+        # value satisfies them - decoding any input eventually errors cleanly
+        # rather than hanging.
         with temp_module(src) as mod:
-            with pytest.raises(RecursionError):
-                msgspec.json.Decoder(mod.Ex)
+            dec = msgspec.json.Decoder(mod.Ex)
+            with pytest.raises(ValidationError):
+                dec.decode(b"[[[[[[]]]]]]")
 
     @py312_plus
     def test_typealias_invalid_type(self):
@@ -4761,15 +4773,10 @@ class TestTypeAlias:
                 msgspec.json.Decoder(mod.Ex)
 
     # ------------------------------------------------------------------ #
-    # Recursive type aliases (support-recursive-typealiases branch).      #
-    # These document the *target* behavior and currently xfail; they      #
-    # should flip to passing once `AliasInfo` indirection lands. Marked    #
-    # strict so an accidental pass alerts us to remove the marker.        #
+    # Recursive type aliases (container-guarded).                         #
     # ------------------------------------------------------------------ #
 
     @py312_plus
-    @pytest.mark.xfail(reason="recursive type aliases not yet supported", strict=True)
-    @emscripten_stack_limited
     def test_recursive_typealias_self(self, proto):
         src = "type JSON = int | str | bool | None | list[JSON] | dict[str, JSON]"
         with temp_module(src) as mod:
@@ -4780,8 +4787,6 @@ class TestTypeAlias:
                 dec.decode(proto.encode(1.5))
 
     @py312_plus
-    @pytest.mark.xfail(reason="recursive type aliases not yet supported", strict=True)
-    @emscripten_stack_limited
     def test_recursive_typealias_mutual(self, proto):
         src = """
         type A = list[B] | None
@@ -4793,8 +4798,6 @@ class TestTypeAlias:
                 assert dec.decode(proto.encode(good)) == good
 
     @py312_plus
-    @pytest.mark.xfail(reason="recursive type aliases not yet supported", strict=True)
-    @emscripten_stack_limited
     def test_recursive_typealias_generic(self, proto):
         src = "type Tree[T] = tuple[T, list[Tree[T]]]"
         with temp_module(src) as mod:
@@ -4805,24 +4808,165 @@ class TestTypeAlias:
                 dec.decode(proto.encode((1, [("x", [])])))
 
     @py312_plus
-    @pytest.mark.xfail(reason="recursive type aliases not yet supported", strict=True)
-    @emscripten_stack_limited
+    def test_recursive_typealias_as_struct_field(self, proto):
+        src = """
+        import msgspec
+        type JSON = int | str | None | list[JSON]
+        class Doc(msgspec.Struct):
+            body: JSON
+        """
+        with temp_module(src) as mod:
+            dec = proto.Decoder(mod.Doc)
+            for body in [1, "x", None, [1, ["two"], []]]:
+                sol = mod.Doc(body=body)
+                assert dec.decode(proto.encode(sol)) == sol
+            with pytest.raises(ValidationError):
+                dec.decode(proto.encode(mod.Doc(body=1.5)))
+
+    @py312_plus
+    def test_recursive_typealias_convert(self):
+        src = "type JSON = int | str | None | list[JSON]"
+        with temp_module(src) as mod:
+            assert msgspec.convert([1, "x", [2, None]], type=mod.JSON) == [
+                1,
+                "x",
+                [2, None],
+            ]
+            with pytest.raises(ValidationError):
+                msgspec.convert([1.5], type=mod.JSON)
+
+    @py312_plus
     def test_recursive_typealias_inspect(self):
         src = "type JSON = int | str | None | list[JSON]"
         with temp_module(src) as mod:
-            # Should return a cyclic type graph without recursing forever.
-            assert msgspec.inspect.type_info(mod.JSON) is not None
+            info = msgspec.inspect.type_info(mod.JSON)
+            # A recursive alias yields a finite, cyclic AliasType graph.
+            assert isinstance(info, msgspec.inspect.AliasType)
+            assert isinstance(info.type, msgspec.inspect.UnionType)
+            # The `list` member's item type refers back to the same AliasType.
+            list_members = [
+                m for m in info.type.types if isinstance(m, msgspec.inspect.ListType)
+            ]
+            assert len(list_members) == 1
+            assert list_members[0].item_type is info
 
     @py312_plus
-    @pytest.mark.xfail(reason="recursive type aliases not yet supported", strict=True)
-    @emscripten_stack_limited
     def test_recursive_typealias_schema(self):
         src = "type JSON = int | str | None | list[JSON]"
         with temp_module(src) as mod:
             schema = msgspec.json.schema(mod.JSON)
-            # A recursive alias must be emitted as a $ref into $defs, not inlined
-            # forever.
-            assert "$defs" in schema or "$ref" in schema
+            # A recursive alias is emitted as a named $ref into $defs, with the
+            # recursive reference pointing back to the same $def.
+            assert schema["$ref"] == "#/$defs/JSON"
+            defn = schema["$defs"]["JSON"]
+            item = next(
+                opt["items"] for opt in defn["anyOf"] if opt.get("type") == "array"
+            )
+            assert item == {"$ref": "#/$defs/JSON"}
+
+    @py312_plus
+    def test_nonrecursive_typealias_stays_transparent(self):
+        # A non-recursive alias must NOT become an AliasType / $ref component;
+        # it should expand transparently to its underlying type.
+        src = "type Simple = int | str"
+        with temp_module(src) as mod:
+            info = msgspec.inspect.type_info(mod.Simple)
+            assert isinstance(info, msgspec.inspect.UnionType)
+            schema = msgspec.json.schema(mod.Simple)
+            assert "$defs" not in schema
+            assert schema == {"anyOf": [{"type": "integer"}, {"type": "string"}]}
+
+    @py312_plus
+    @pytest.mark.parametrize(
+        "wrapper", ["Annotated[{0}, Meta(title='x')]", "Final[{0}]"]
+    )
+    @pytest.mark.parametrize("alias", ["int | str", "int | list[JSON]"])
+    def test_typealias_wrapped(self, proto, wrapper, alias):
+        # Regression: alias detection must not misfire on Annotated/Final
+        # wrappers (whose `__origin__` may itself be a TypeAliasType). Covers
+        # both non-recursive and recursive aliases.
+        src = f"""
+        from typing import Annotated, Final
+        from msgspec import Meta
+        type JSON = {alias}
+        Ex = {wrapper.format("JSON")}
+        """
+        with temp_module(src) as mod:
+            dec = proto.Decoder(mod.Ex)
+            assert dec.decode(proto.encode(1)) == 1
+
+    @py312_plus
+    def test_typealias_constraint_inside(self, proto):
+        # A `Meta` constraint on a type *inside* a recursive alias is enforced.
+        src = """
+        from typing import Annotated
+        from msgspec import Meta
+        type Small = Annotated[int, Meta(le=3)] | list[Small]
+        """
+        with temp_module(src) as mod:
+            dec = proto.Decoder(mod.Small)
+            assert dec.decode(proto.encode([3, [2]])) == [3, [2]]
+            with pytest.raises(ValidationError) as rec:
+                dec.decode(proto.encode([5]))
+            assert "at `$[0]`" in str(rec.value)
+
+    @py312_plus
+    def test_typealias_error_location(self, proto):
+        # Validation errors report the correct nested path through an alias.
+        src = "type L = int | list[L]"
+        with temp_module(src) as mod:
+            dec = proto.Decoder(mod.L)
+            with pytest.raises(ValidationError) as rec:
+                dec.decode(proto.encode([1, [2, 1.5]]))
+            assert "at `$[1][1]`" in str(rec.value)
+
+    @py312_plus
+    def test_typealias_in_union(self, proto):
+        # An alias used as a union member stays transparent: its members are
+        # flattened into the outer union.
+        src = "type IntListInts = int | list[int]"
+        with temp_module(src) as mod:
+            dec = proto.Decoder(mod.IntListInts | None)
+            assert dec.decode(proto.encode(1)) == 1
+            assert dec.decode(proto.encode([1, 2])) == [1, 2]
+            assert dec.decode(proto.encode(None)) is None
+            with pytest.raises(ValidationError):
+                dec.decode(proto.encode("x"))
+
+    @py312_plus
+    def test_recursive_typealias_info_cached(self):
+        # Two decoders of the same alias reuse a single cached AliasInfo, keyed
+        # in the module-level alias cache. Repeated builds don't grow the cache.
+        from msgspec import _core
+
+        with temp_module("type JSON = int | list[JSON]") as mod:
+            msgspec.json.Decoder(mod.JSON)
+            assert mod.JSON in _core._alias_cache
+            info = _core._alias_cache[mod.JSON]
+            size = len(_core._alias_cache)
+            for _ in range(3):
+                msgspec.json.Decoder(mod.JSON)
+                msgspec.msgpack.Decoder(mod.JSON)
+            assert _core._alias_cache[mod.JSON] is info
+            assert len(_core._alias_cache) == size
+
+    @py312_plus
+    @emscripten_stack_limited
+    def test_recursive_typealias_gc(self):
+        # The AliasInfo holds the alias's value TypeNode, which refers back to
+        # the AliasInfo - a cycle. It must be GC-tracked so it stays collectable.
+        from msgspec import _core
+
+        with temp_module("type JSON = int | list[JSON]") as mod:
+            msgspec.json.Decoder(mod.JSON)
+            info = _core._alias_cache[mod.JSON]
+            assert gc.is_tracked(info)
+            # Building a decoder repeatedly doesn't leak references to the info.
+            count = sys.getrefcount(info)
+            dec = msgspec.json.Decoder(mod.JSON)
+            del dec
+            gc.collect()
+            assert sys.getrefcount(info) == count
 
 
 class TestDecimal:

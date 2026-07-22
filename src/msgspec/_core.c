@@ -5471,7 +5471,13 @@ TypeNode_Convert(PyObject *obj) {
     {
         bool is_alias =
             Py_TYPE(obj) == (PyTypeObject *)(state.mod->typing_typealiastype);
-        if (!is_alias) {
+        /* A parametrized alias (`Alias[int]`) has `__origin__` set to the
+         * TypeAliasType. Exclude `Annotated[...]`, whose `__origin__` is the
+         * wrapped type (possibly itself an alias) - those must fall through to
+         * normal collection so the `Annotated` wrapper/metadata is handled
+         * first. */
+        if (!is_alias &&
+            Py_TYPE(obj) != (PyTypeObject *)(state.mod->typing_annotated_alias)) {
             PyObject *origin = PyObject_GetAttr(obj, state.mod->str___origin__);
             if (origin != NULL) {
                 is_alias = Py_TYPE(origin) ==

@@ -37,6 +37,8 @@ if sys.version_info >= (3, 15):
     # and to not raise `F821`:
     from builtins import frozendict
 
+py312_plus = pytest.mark.skipif(sys.version_info < (3, 12), reason="3.12+ only")
+
 T = TypeVar("T")
 
 
@@ -1431,3 +1433,50 @@ def test_multiline_docstring():
             }
         },
     }
+
+
+@py312_plus
+def test_recursive_typealias():
+    with temp_module("type JSON = int | str | None | list[JSON]") as mod:
+        assert msgspec.json.schema(mod.JSON) == {
+            "$ref": "#/$defs/JSON",
+            "$defs": {
+                "JSON": {
+                    "anyOf": [
+                        {"type": "integer"},
+                        {"type": "string"},
+                        {"type": "array", "items": {"$ref": "#/$defs/JSON"}},
+                        {"type": "null"},
+                    ]
+                }
+            },
+        }
+
+
+@py312_plus
+def test_recursive_typealias_generic():
+    with temp_module("type Tree[T] = tuple[T, list[Tree[T]]]") as mod:
+        assert msgspec.json.schema(mod.Tree[int]) == {
+            "$ref": "#/$defs/Tree_int_",
+            "$defs": {
+                "Tree_int_": {
+                    "type": "array",
+                    "prefixItems": [
+                        {"type": "integer"},
+                        {"type": "array", "items": {"$ref": "#/$defs/Tree_int_"}},
+                    ],
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": False,
+                }
+            },
+        }
+
+
+@py312_plus
+def test_nonrecursive_typealias_not_a_component():
+    # A non-recursive alias must expand transparently, with no $defs component.
+    with temp_module("type Simple = int | str") as mod:
+        assert msgspec.json.schema(mod.Simple) == {
+            "anyOf": [{"type": "integer"}, {"type": "string"}]
+        }

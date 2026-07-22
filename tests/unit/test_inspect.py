@@ -214,6 +214,31 @@ def test_typealias(src, typ):
         assert mi.type_info(mod.Ex) == mi.type_info(typ)
 
 
+@py312_plus
+def test_recursive_typealias():
+    with temp_module("type JSON = int | str | None | list[JSON]") as mod:
+        info = mi.type_info(mod.JSON)
+        # A recursive alias yields a finite, cyclic AliasType graph.
+        assert isinstance(info, mi.AliasType)
+        assert info.cls is mod.JSON
+        assert isinstance(info.type, mi.UnionType)
+        (list_member,) = [m for m in info.type.types if isinstance(m, mi.ListType)]
+        # The recursive reference points back to the same AliasType object.
+        assert list_member.item_type is info
+
+
+@py312_plus
+def test_recursive_typealias_generic():
+    with temp_module("type Tree[T] = tuple[T, list[Tree[T]]]") as mod:
+        info = mi.type_info(mod.Tree[int])
+        assert isinstance(info, mi.AliasType)
+        assert isinstance(info.type, mi.TupleType)
+        first, second = info.type.item_types
+        assert isinstance(first, mi.IntType)
+        assert isinstance(second, mi.ListType)
+        assert second.item_type is info
+
+
 def test_final():
     cases = [
         (int, mi.IntType()),

@@ -133,6 +133,12 @@ def _collect_component_types(type_infos: Iterable[mi.Type]) -> dict[Any, mi.Type
                 components[t.cls] = t
                 for f in t.fields:
                     collect(f.type)
+        elif isinstance(t, mi.AliasType):
+            # A recursive type alias is emitted as a named `$ref` component. The
+            # `t.cls not in components` guard also breaks the reference cycle.
+            if t.cls not in components:
+                components[t.cls] = t
+                collect(t.type)
         elif isinstance(t, mi.EnumType):
             components[t.cls] = t
         elif isinstance(t, mi.Metadata):
@@ -195,7 +201,12 @@ def _build_name_map(component_types: dict[Any, mi.Type]) -> dict[Any, str]:
         return re.sub(r"[^a-zA-Z0-9.\-_]", "_", name)
 
     def fullname(cls):
-        return normalize(f"{cls.__module__}.{cls.__qualname__}")
+        # Type aliases (and parametrized generics) may lack `__qualname__` and
+        # have a `None` `__module__`; fall back to the display name.
+        origin = getattr(cls, "__origin__", cls)
+        module = getattr(origin, "__module__", None)
+        qualname = getattr(origin, "__qualname__", None) or _get_class_name(cls)
+        return normalize(f"{module}.{qualname}")
 
     conflicts = set()
     names: dict[str, Any] = {}
@@ -449,6 +460,11 @@ class _SchemaGenerator:
                 schema["type"] = "object"
                 schema["properties"] = dict(zip(names, fields))
                 schema["required"] = required
+        elif isinstance(t, mi.AliasType):
+            # Reached only with check_ref=False (generating the component body);
+            # otherwise the `$ref` short-circuit above handles it. The alias's
+            # schema is simply that of the type it expands to.
+            schema = mi._merge_json(self.to_schema(t.type), schema)
         elif isinstance(t, mi.ExtType):
             raise TypeError("json-schema doesn't support msgpack Ext types")
         elif isinstance(t, mi.CustomType):
