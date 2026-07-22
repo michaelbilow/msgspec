@@ -51,6 +51,65 @@ TypedDict / dataclass / NamedTuple use the same pattern via `__msgspec_cache__`.
 Their Info objects are GC-tracked and traversed so the reference cycle is
 collectable by Python's GC (not freed by raw recursion).
 
+## ⚠️ Revision: `__msgspec_cache__`-on-the-alias does NOT work
+
+Verified on 3.12 and 3.13 (`/tmp/alias_attr.py`, `/tmp/cache_strategy.py`,
+`/tmp/key_props.py`):
+
+- **`TypeAliasType`** (bare `type JSON = ...`) has **no `__dict__`** and rejects
+  attribute assignment: `AttributeError: ... no __dict__ for setting new
+  attributes`. So we cannot stash a placeholder on it the way structs do.
+- **Parametrized `Pair[int]`** is a `types.GenericAlias` (NOT the interned
+  `typing._GenericAlias` that generic *structs* produce). It is likewise
+  attribute-less, AND it is **transient**: `Pair[int] is Pair[int]` is `False`.
+  So there's no stable object to hang an attribute on either.
+  - (This is exactly why generic-alias *structs* can use `__msgspec_cache__`:
+    `S[int]` is a `typing._GenericAlias`, which is interned and writable. Aliases
+    are a different, unwritable type — the struct precedent does not transfer.)
+
+What IS true of aliases:
+- Bare `JSON` has **stable identity** (`JSON is ns['JSON']`) and is **hashable**.
+- Parametrized `Pair[int]` is **hashable** and **value-equal**
+  (`Pair[int] == Pair[int]` is `True`), so it works as a plain-dict key even
+  though each instance is a fresh object.
+- Neither is **weakref-able** (`TypeError: cannot create weak reference`), so a
+  `WeakKeyDictionary` / `WeakValueDictionary` is out.
+
+### Revised caching strategy
+
+Use a **module-level cache dict keyed by the alias object**, not an attribute:
+
+- Store `alias -> AliasInfo` (and `parametrized_alias -> AliasInfo`) in a dict
+  held in module state (like the existing `struct_lookup_cache` at `:485`, which
+  is already a module-level cache rather than a per-type attribute).
+- Insert the placeholder `AliasInfo` into this dict **before** expanding
+  `__value__`; the recursive `TypeNode_Convert` re-entry looks up the dict, finds
+  the in-flight `AliasInfo`, and stops. Same cycle-break, different storage.
+- Because aliases aren't weakref-able, entries are **strong refs** and live for
+  the process (or until an explicit cap/eviction, cf. the 64-entry LRU on
+  `struct_lookup_cache` at `:4772`). Acceptable — a program has a bounded set of
+  alias types — but note it in the risks.
+- Keying: bare alias by identity works; parametrized by value-equality works.
+  Confirm `hash`/`==` are consistent enough that `Pair[int]` and `Pair[str]`
+  don't collide (they hash differently — verified) and that
+  `Pair[int] == Pair[int]` across instances is stable (verified True).
+
+### OPEN DECISION for the user (changes the C surface)
+
+The Python-attribute cache is off the table; pick the storage:
+
+1. **Module-level dict in `MsgspecState`** keyed by the alias (recommended;
+   mirrors `struct_lookup_cache`). Needs GC traverse/clear of that dict and
+   thread-safety via the existing critical-section pattern.
+2. **Resolve aliases in Python before they reach C** — expand `__value__` in
+   `_utils.py`/a helper into a structure the C layer already handles, breaking
+   cycles Python-side with a normal dict + placeholder. Keeps `_core.c` smaller
+   but moves real logic into Python and must reproduce the parametrized-generic
+   substitution (`alias.__value__[args]`) faithfully.
+
+Everything downstream of "how the placeholder is stored" (AliasInfo object,
+MS_TYPE_ALIAS flag, dispatch, traverse) is unchanged from steps A2/A5/A6/A7.
+
 ## Layers affected
 
 | Layer | File | Recursive today? | Work |
@@ -80,11 +139,13 @@ collectable by Python's GC (not freed by raw recursion).
    dedicated collector that sets `MS_TYPE_ALIAS` + stashes the alias object.
    ⚠️ Must still support the existing non-recursive expansion semantics and the
    parametrized-generic-alias substitution (`alias.__value__[args]`, `:4922`).
-4. **`AliasInfo_Convert`:** mirror `StructInfo_Convert`:
-   `get_msgspec_cache` → alloc → cache on alias via `__msgspec_cache__` →
+4. **`AliasInfo_Convert`:** mirror `StructInfo_Convert`'s *shape*, but store the
+   placeholder in a **module-level dict keyed by the alias object** (see
+   "Revised caching strategy" above), NOT `__msgspec_cache__` (aliases have no
+   `__dict__`). Sequence: dict lookup → alloc → insert placeholder into dict →
    `TypeNode_Convert(alias.__value__ [substituted])` → fill `info->type`.
-   Back-references resolve to the cached placeholder. Handle error-path cache
-   deletion.
+   Back-references resolve to the in-flight `AliasInfo`. Handle error-path
+   dict-entry removal. ⚠️ storage form pending the OPEN DECISION above.
 5. **`TypeNode_get_alias_info`** accessor (pop-count slot indexing like
    `TypeNode_get_struct_info` `:3140`).
 6. **Decode dispatch:** at each decode entry (json + msgpack), when
@@ -92,9 +153,11 @@ collectable by Python's GC (not freed by raw recursion).
    `info->type`. Same for the **convert** dispatcher.
 7. **`TypeNode_traverse` / `TypeNode_Free`:** treat the `AliasInfo*` slot as a
    PyObject (Py_DECREF), NOT as a raw `TypeNode*` (so no raw-recursion cycle).
-8. **msgspec_cache invalidation / GC:** ensure alias `__msgspec_cache__` entries
-   participate in the same overwrite-detection (`get_msgspec_cache` `:4131`) and
-   are cleared on module teardown paths already handled for other Info types.
+8. **Cache lifecycle / GC:** the module-level alias cache dict must be added to
+   `MsgspecState`, GC-traversed and cleared alongside the other module-state
+   members (cf. the module-state clearing already done for `struct_lookup_cache`
+   and friends), and guarded by the existing critical-section pattern for
+   free-threaded builds.
 
 ### B. `inspect.py`
 
@@ -135,14 +198,17 @@ collectable by Python's GC (not freed by raw recursion).
 
 - **Hot-path cost:** one extra pointer-hop + branch per alias-typed value at
   decode time. Paid only by alias-typed fields; acceptable per design decision.
-- **`__msgspec_cache__` on `TypeAliasType`:** confirm the object permits
-  arbitrary attribute assignment (structs use a metaclass slot; TypedDict etc.
-  use `__msgspec_cache__` on the type — a `TypeAliasType` is a plain object, so
-  this should work, but verify on 3.12/3.13/3.14).
-- **Generic aliases:** the placeholder must be keyed such that `Alias` and
-  `Alias[int]` don't collide incorrectly. Structs solve this by caching
-  `StructInfo` on the *generic alias* via `__msgspec_cache__` while plain
-  structs use the metaclass slot — follow the same split.
+- **RESOLVED — cache storage:** `__msgspec_cache__` on the alias is impossible
+  (`TypeAliasType`/`types.GenericAlias` have no `__dict__` and aren't
+  weakref-able). Superseded by the module-level dict keyed by alias object (see
+  the ⚠️ Revision section). Storage form is the OPEN DECISION above.
+- **Cache is a strong ref → aliases are pinned for process lifetime** (not
+  weakref-able). Bounded in practice; consider the same LRU cap as
+  `struct_lookup_cache` if unbounded growth is a concern.
+- **Generic aliases keying:** bare alias keys by identity; `Alias[int]` keys by
+  value-equality (`==`/`hash`, verified stable and non-colliding across
+  `Alias[int]`/`Alias[str]`). Each `Alias[int]` is a *fresh transient* object,
+  so identity-keying would miss — must use value-equality.
 - **This is a C-extension change** → requires `just rebuild=1 test`. Every test
   run in this branch must rebuild.
 
