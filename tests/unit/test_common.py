@@ -2789,6 +2789,21 @@ class TestStructDefaults:
 
 
 class TestTypedDict:
+    def test_postponed_annotations(self, proto):
+        # Regression test for Python 3.12.0-3.12.3, where the fourth argument
+        # to typing._eval_type is recursive_guard rather than type_params.
+        source = """
+        from __future__ import annotations
+        from typing import TypedDict
+
+        class Ex(TypedDict):
+            x: int
+        """
+
+        with temp_module(source) as mod:
+            msg = proto.encode({"x": 1})
+            assert proto.decode(msg, type=mod.Ex) == {"x": 1}
+
     def test_types_generic_alias_non_generic_errors(self):
         # mostly a smoke test to weed out some bogus stuff that may get passed to us.
         # parametrising a non-generic TypedDict via a manually-built
