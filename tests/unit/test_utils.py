@@ -239,10 +239,13 @@ class TestGetClassAnnotations:
     @py312_plus
     def test_pep695_generic_typeddict(self):
         # `from __future__ import annotations` is load-bearing: it triggers the
-        # module-bound ForwardRefs that previously failed to resolve `T`.
+        # module-bound ForwardRefs that previously failed to resolve `T`. The
+        # legacy TypeVar ensures the module global doesn't shadow the PEP 695
+        # type parameter.
         source = """
         from __future__ import annotations
-        from typing import TypedDict
+        from typing import TypeVar, TypedDict
+        T = TypeVar("T")
         class Ex[T](TypedDict):
             x: T
             y: list[T]

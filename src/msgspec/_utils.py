@@ -43,17 +43,21 @@ else:
 # The type_params kwarg was added in 3.12.4 and made mandatory in 3.13. Threading
 # it lets module-bound ForwardRefs (built eagerly by TypedDict) resolve PEP 695
 # type params, whose evaluation would otherwise ignore the locals we stash them in.
+# Copying them into localns also prevents same-named module globals from shadowing
+# the type parameter on Python versions where ForwardRef replaces globalns.
 if sys.version_info >= (3, 12, 4):
 
     def _eval_type(t, globalns, localns, type_params=()):
+        if type_params:
+            localns = dict(localns)
+            localns.update((param.__name__, param) for param in type_params)
         return typing._eval_type(t, globalns, localns, type_params=type_params)
 
 else:
 
     def _eval_type(t, globalns, localns, type_params=()):
         # On Python 3.12.0-3.12.3 the fourth positional argument is
-        # recursive_guard. Make type params available through localns instead;
-        # unlike globalns, it isn't replaced by module-bound ForwardRefs.
+        # recursive_guard.
         if type_params:
             localns = dict(localns)
             localns.update((param.__name__, param) for param in type_params)
