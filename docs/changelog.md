@@ -23,7 +23,7 @@
   type parameter syntax (`class Foo[T](TypedDict)`) under
   `from __future__ import annotations` on Python 3.12/3.13. Also prevent a
   same-named module-level `TypeVar` from shadowing the PEP 695 type parameter,
-  which could silently affect decoding on Python 3.14 ({pr}`1130`).
+  which could silently affect decoding on Python 3.12+ ({pr}`1130`).
 - Fix `NameError` when creating a `Struct` with an unquoted forward
   reference on Python 3.14 ({issue}`1165`).
 - Fix a crash on incorrect `typing.ClassVar` annotations ({pr}`1097`).
