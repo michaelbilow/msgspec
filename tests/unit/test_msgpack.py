@@ -401,6 +401,9 @@ class TestEncoderMisc:
         with pytest.raises(TypeError):
             enc.encode_into(1, bytearray(), "bad")
 
+        with pytest.raises(TypeError):
+            enc.encode_into(1, bytearray(), None)
+
         with pytest.raises(ValueError, match="offset"):
             enc.encode_into(1, bytearray(), -2)
 
@@ -535,6 +538,21 @@ class TestDecoderMisc:
     def test_decode_invalid_opcode_error(self):
         with pytest.raises(msgspec.DecodeError, match="invalid opcode '\\\\xc1'"):
             msgspec.msgpack.decode(b"\xc1abc")
+
+    @pytest.mark.parametrize(
+        "hex_data",
+        [
+            "818001",  # map used as map key
+            "878048",  # map used as map key
+            "8bd4ec5c03",  # ext used as map key
+        ],
+    )
+    def test_decode_unhashable_map_key_raises_decode_error(self, hex_data):
+        with pytest.raises(msgspec.DecodeError, match="map keys must be hashable"):
+            msgspec.msgpack.decode(bytes.fromhex(hex_data))
+
+    def test_decode_hashable_array_map_key_ok(self):
+        assert msgspec.msgpack.decode(bytes.fromhex("819001")) == {(): 1}
 
     def test_decode_skip_invalid_submessage_raises(self):
         """Ensure errors in submessage skipping are raised"""

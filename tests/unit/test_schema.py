@@ -1,6 +1,7 @@
 import datetime
 import decimal
 import enum
+import json
 import sys
 import typing
 import uuid
@@ -373,6 +374,24 @@ def test_struct_object():
     }
 
 
+@pytest.mark.parametrize(
+    "factory, default",
+    [
+        (list, []),
+        (dict, {}),
+        (set, []),
+        (bytearray, ""),
+    ],
+)
+def test_struct_default_factory_default(factory, default):
+    class Example(msgspec.Struct):
+        x: factory = msgspec.field(default_factory=factory)
+
+    schema = msgspec.json.schema(Example)["$defs"]["Example"]
+    assert schema["properties"]["x"]["default"] == default
+    json.dumps(schema)
+
+
 @pytest.mark.parametrize("forbid_unknown_fields", [False, True])
 def test_struct_array_like(forbid_unknown_fields):
     class Example(
@@ -409,6 +428,20 @@ def test_struct_array_like(forbid_unknown_fields):
     if forbid_unknown_fields:
         sol["$defs"]["Example"]["maxItems"] = 4
     assert msgspec.json.schema(Example) == sol
+
+
+@pytest.mark.parametrize(
+    "tag, min_items, payload",
+    [(False, 0, b"[]"), (True, 1, b'["Example"]')],
+)
+def test_struct_array_like_all_fields_optional(tag, min_items, payload):
+    class Example(msgspec.Struct, array_like=True, tag=tag):
+        a: int = 1
+        b: list[int] = msgspec.field(default_factory=list)
+
+    schema = msgspec.json.schema(Example)["$defs"]["Example"]
+    assert msgspec.json.decode(payload, type=Example) == Example()
+    assert schema["minItems"] == min_items
 
 
 def test_struct_no_fields():
@@ -1205,6 +1238,25 @@ def test_dict_key_metadata(field, val, constraint):
         "type": "object",
         "additionalProperties": {"type": "integer"},
         "propertyNames": {constraint: val},
+    }
+
+
+@pytest.mark.parametrize(
+    "meta, property_names",
+    [
+        (Meta(title="key"), {"title": "key"}),
+        (
+            Meta(title="key", pattern="^A$"),
+            {"title": "key", "pattern": "^A$"},
+        ),
+    ],
+)
+def test_dict_key_metadata_with_schema_metadata(meta, property_names):
+    typ = Annotated[str, meta]
+    assert msgspec.json.schema(dict[typ, int]) == {
+        "type": "object",
+        "additionalProperties": {"type": "integer"},
+        "propertyNames": property_names,
     }
 
 
